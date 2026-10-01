@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Iterable
+from contextlib import suppress
 from datetime import timedelta
 from itertools import groupby
 from operator import itemgetter
@@ -31,6 +32,8 @@ from aiohomekit.exceptions import (
     HttpErrorResponse,
     HttpException,
     InvalidError,
+    RequestNotSentError,
+    RequestOutcomeUnknownError,
     UnknownError,
     UnpairedError,
 )
@@ -43,7 +46,7 @@ from aiohomekit.model.characteristics import (
 from aiohomekit.protocol import error_handler
 from aiohomekit.protocol.statuscodes import HapStatusCode, to_status_code
 from aiohomekit.protocol.tlv import TLV
-from aiohomekit.utils import asyncio_timeout
+from aiohomekit.utils import async_create_task, asyncio_timeout
 from aiohomekit.uuid import normalize_uuid
 from aiohomekit.zeroconf import HomeKitService, ZeroconfPairing
 
@@ -53,6 +56,42 @@ logger = logging.getLogger(__name__)
 
 
 EMPTY_EVENT = {}
+SUBSCRIBE_RETRY_INITIAL = 5
+SUBSCRIBE_RETRY_MAX = 60 * 60
+RETRYABLE_SUBSCRIBE_STATUSES = {
+    HapStatusCode.UNABLE_TO_COMMUNICATE,
+    HapStatusCode.RESOURCE_BUSY,
+    HapStatusCode.OUT_OF_RESOURCES,
+    HapStatusCode.TIMED_OUT,
+    HapStatusCode.NOT_ALLOWED_IN_CURRENT_STATE,
+}
+
+
+def _parse_subscription_response(response: Any, batch: set[tuple[int, int]]) -> dict:
+    if not isinstance(response, dict):
+        raise RequestOutcomeUnknownError("Malformed subscription response")
+    if not response:
+        return {}  # HTTP 204 has no characteristic statuses.
+
+    global_status = response.get("status", 0)
+    if type(global_status) is not int:
+        raise RequestOutcomeUnknownError("Malformed subscription status")
+    codes = dict.fromkeys(batch, global_status) if global_status else {}
+    rows = response.get("characteristics", [])
+    if not isinstance(rows, list):
+        raise RequestOutcomeUnknownError("Malformed subscription characteristics")
+    for row in rows:
+        if not isinstance(row, dict) or any(
+            type(row.get(key)) is not int for key in ("aid", "iid", "status")
+        ):
+            raise RequestOutcomeUnknownError("Malformed subscription characteristic status")
+        codes[(row["aid"], row["iid"])] = row["status"]
+    if "status" not in response and not batch <= codes.keys():
+        raise RequestOutcomeUnknownError("Incomplete subscription response")
+    return {
+        char: {"status": code, "description": to_status_code(code).description}
+        for char, code in codes.items()
+    }
 
 
 def format_characteristic_list(
@@ -119,6 +158,18 @@ class IpPairing(ZeroconfPairing):
         self.pairing_data = pairing_data
         self.connection = SecureHomeKitConnection(self, self.pairing_data)
         self.supports_subscribe = True
+        self._subscription_loop = asyncio.get_running_loop()
+        self._subscription_lock = asyncio.Lock()
+        self._subscription_task: asyncio.Task[dict] | None = None
+        self._subscription_timer: asyncio.TimerHandle | None = None
+        self._subscription_closed = False
+        self._subscription_session = None
+        self._subscription_generation = 0
+        self._acknowledged_subscriptions: set[tuple[int, int]] = set()
+        self._unsupported_subscriptions: dict[tuple[int, int], dict] = {}
+        self._rejected_subscriptions: dict[tuple[int, int], dict] = {}
+        self._subscription_retry_delay = SUBSCRIBE_RETRY_INITIAL
+        self._subscription_retry_at = 0.0
 
         super().__init__(controller, pairing_data)
 
@@ -154,19 +205,24 @@ class IpPairing(ZeroconfPairing):
         self._callback_listeners(format_characteristic_list(event))
 
     async def connection_made(self, secure):
-        if not secure:
+        if not secure or self._shutdown or self._subscription_closed:
             return
 
+        self._set_subscription_session(self.connection.protocol)
         # Let our listeners know the connection is available again
         self._callback_listeners(EMPTY_EVENT)
 
-        if self.subscriptions:
-            await self.subscribe(self.subscriptions)
+        # Restoration must not run inside the connector: a failed subscription
+        # can disconnect again while that connector is still marked as running.
+        self._schedule_subscriptions()
 
     async def _ensure_connected(self):
         """Ensure we are connected to the device."""
         connection = self.connection
-        if self._shutdown or connection.is_connected:
+        if self._shutdown:
+            raise RequestNotSentError("Pairing has been shut down")
+        self._subscription_closed = False
+        if connection.is_connected:
             return
 
         try:
@@ -196,6 +252,19 @@ class IpPairing(ZeroconfPairing):
         """
         Close the pairing's communications. This closes the session.
         """
+        self._subscription_closed = True
+        self._cancel_subscription_timer()
+        task, self._subscription_task = self._subscription_task, None
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        self._subscription_session = None
+        self._subscription_generation += 1
+        self._acknowledged_subscriptions.clear()
+        self._rejected_subscriptions.clear()
+        self._subscription_retry_at = 0.0
+        self._subscription_retry_delay = SUBSCRIBE_RETRY_INITIAL
         await self.connection.close()
         await asyncio.sleep(0)
 
@@ -368,7 +437,13 @@ class IpPairing(ZeroconfPairing):
         """Provision a device with Thread network credentials."""
 
     async def subscribe(self, characteristics):
-        await super().subscribe(set(characteristics))
+        """Retain subscription intent and attempt it when recovery permits.
+
+        An empty result contains no characteristic errors; it does not prove
+        subscription acceptance or subsequent event delivery.
+        """
+        characteristics = set(characteristics)
+        await super().subscribe(characteristics)
 
         if not self.supports_subscribe:
             logger.info(
@@ -376,31 +451,169 @@ class IpPairing(ZeroconfPairing):
             )
             return None
 
+        if self._shutdown:
+            return {}
+        self._subscription_closed = False
+        for char in characteristics:
+            self._rejected_subscriptions.pop(char, None)
+
+        task = self._schedule_subscriptions()
+        result = await asyncio.shield(task) if task else {}
+        statuses = self._unsupported_subscriptions | self._rejected_subscriptions | result
+        return {char: status for char, status in statuses.items() if char in characteristics and status}
+
+    def _set_subscription_session(self, protocol) -> None:
+        if protocol is not self._subscription_session:
+            self._subscription_session = protocol
+            self._subscription_generation += 1
+            self._acknowledged_subscriptions.clear()
+            self._rejected_subscriptions.clear()
+
+    def _subscription_session_is_current(self, protocol, generation: int) -> bool:
+        return protocol is self.connection.protocol and generation == self._subscription_generation
+
+    def _pending_subscriptions(self) -> set[tuple[int, int]]:
+        return (
+            self.subscriptions
+            - self._acknowledged_subscriptions
+            - self._unsupported_subscriptions.keys()
+            - self._rejected_subscriptions.keys()
+        )
+
+    def _cancel_subscription_timer(self) -> None:
+        if self._subscription_timer:
+            self._subscription_timer.cancel()
+            self._subscription_timer = None
+
+    def _schedule_subscriptions(self) -> asyncio.Task[dict] | None:
+        if (
+            self._shutdown
+            or self._subscription_closed
+            or not self.supports_subscribe
+            or not self._pending_subscriptions()
+        ):
+            self._cancel_subscription_timer()
+            return None
+        if self._subscription_loop.time() < self._subscription_retry_at:
+            if not self._subscription_timer:
+                self._subscription_timer = self._subscription_loop.call_at(
+                    self._subscription_retry_at, self._subscription_retry_ready
+                )
+            return None
+        self._cancel_subscription_timer()
+        if not self._subscription_task or self._subscription_task.done():
+            self._subscription_task = async_create_task(
+                self._restore_subscriptions(), name=f"HomeKit subscriptions {self.id}"
+            )
+            self._subscription_task.add_done_callback(self._subscription_finished)
+        return self._subscription_task
+
+    def _subscription_retry_ready(self) -> None:
+        self._subscription_timer = None
+        self._schedule_subscriptions()
+
+    def _subscription_finished(self, task: asyncio.Task[dict]) -> None:
+        if self._subscription_task is not task:
+            return
+        self._subscription_task = None
+        if task.cancelled() or task.exception():
+            return
+        # If connection establishment failed, the existing connector will wake
+        # us on authentication. Do not create another worker in a tight loop.
+        if self.connection.is_connected or self._subscription_loop.time() < self._subscription_retry_at:
+            self._schedule_subscriptions()
+
+    def _defer_subscriptions(self) -> None:
+        if self._shutdown or self._subscription_closed:
+            return
+        delay = self._subscription_retry_delay
+        self._subscription_retry_at = self._subscription_loop.time() + delay
+        self._subscription_retry_delay = min(delay * 2, SUBSCRIBE_RETRY_MAX)
+        logger.debug("%s: Subscription recovery deferred for %s seconds", self.name, delay)
+        self._schedule_subscriptions()
+
+    async def _restore_subscriptions(self) -> dict:
+        statuses = {}
+        if self._shutdown or self._subscription_closed:
+            return statuses
+        # No subscription lock may be held while waiting for authentication.
         try:
             await self._ensure_connected()
         except AccessoryDisconnectedError:
-            logger.debug("Attempted to subscribe to characteristics but could not connect to accessory")
-            return {}
+            logger.debug("%s: Could not connect to restore subscriptions", self.name)
+            return statuses
 
-        try:
-            return await self._update_subscriptions(characteristics, True)
-        except AccessoryDisconnectedError:
-            self.supports_subscribe = False
-            return {}
+        async with self._subscription_lock:
+            if self._shutdown or self._subscription_closed or not self.connection.is_connected:
+                return statuses
+            self._set_subscription_session(self.connection.protocol)
+            attempted = set()
+            while pending := self._pending_subscriptions() - attempted:
+                if self._subscription_loop.time() < self._subscription_retry_at:
+                    return statuses
+                aid = min(pending)[0]
+                batch = {char for char in pending if char[0] == aid}
+                # Retryable rejections stay pending, but must wait for the next
+                # recovery pass rather than repeating inside this worker.
+                attempted.update(batch)
+                session = self.connection.protocol
+                generation = self._subscription_generation
+                try:
+                    result = await self._update_subscriptions(batch, True)
+                except HttpErrorResponse as ex:
+                    if not self._subscription_session_is_current(session, generation):
+                        return statuses
+                    self._rejected_subscriptions.update({char: {} for char in batch})
+                    logger.warning("%s: Subscription rejected with HTTP %s", self.name, ex.response.code)
+                    continue
+                except RequestNotSentError as ex:
+                    if session is self.connection.protocol:
+                        self.connection._connection_lost(ex)
+                    return statuses
+                except AccessoryDisconnectedError:
+                    # A lost response cannot establish unsupported capability.
+                    # Retain intent; the timer bounds attempts, not their count.
+                    self._defer_subscriptions()
+                    return statuses
+
+                if not self._subscription_session_is_current(session, generation):
+                    return statuses
+                statuses.update(result)
+                for char in batch:
+                    status = result.get(char, {})
+                    code = to_status_code(status.get("status", 0))
+                    if code == HapStatusCode.SUCCESS:
+                        self._acknowledged_subscriptions.add(char)
+                    elif code == HapStatusCode.NOTIFICATION_NOT_SUPPORTED:
+                        self._unsupported_subscriptions[char] = status
+                    elif code not in RETRYABLE_SUBSCRIBE_STATUSES:
+                        self._rejected_subscriptions[char] = status
+
+            # Partial batch success must not continually reset the backoff for
+            # a bridge whose other subscriptions still fail on every attempt.
+            if self._pending_subscriptions():
+                self._defer_subscriptions()
+            elif self.subscriptions & self._acknowledged_subscriptions:
+                self._subscription_retry_at = 0.0
+                self._subscription_retry_delay = SUBSCRIBE_RETRY_INITIAL
+            return statuses
 
     async def unsubscribe(self, characteristics):
-        if not self.connection.is_connected:
-            # If not connected no need to unsubscribe
-            await super().unsubscribe(characteristics)
-            return {}
-
-        await self._ensure_connected()
         char_set = set(characteristics)
-        status = await self._update_subscriptions(characteristics, False)
-        for id_tuple in status:
-            char_set.discard(id_tuple)
-
-        await super().unsubscribe(char_set)
+        if self.connection.is_connected:
+            await self._ensure_connected()
+        async with self._subscription_lock:
+            status = await self._update_subscriptions(char_set, False) if self.connection.is_connected else {}
+            removed = {
+                char
+                for char in char_set
+                if to_status_code(status.get(char, {}).get("status", 0)) == HapStatusCode.SUCCESS
+            }
+            await super().unsubscribe(removed)
+            self._acknowledged_subscriptions.difference_update(removed)
+            for char in removed:
+                self._rejected_subscriptions.pop(char, None)
+        self._schedule_subscriptions()
         return status
 
     async def _update_subscriptions(self, characteristics, ev):
@@ -414,21 +627,15 @@ class IpPairing(ZeroconfPairing):
         # between await calls
         char_payloads = [
             [{"aid": aid, "iid": iid, "ev": ev} for aid, iid in aid_iids]
-            for _, aid_iids in groupby(characteristics, key=itemgetter(0))
+            for _, aid_iids in groupby(sorted(characteristics), key=itemgetter(0))
         ]
         for char_payload in char_payloads:
             response = await self.connection.put_json(
                 "/characteristics",
                 {"characteristics": char_payload},
             )
-            if response:
-                # An empty body is a success response
-                for row in response.get("characteristics", []):
-                    if "aid" in row and "iid" in row:
-                        status[(row["aid"], row["iid"])] = {
-                            "status": row["status"],
-                            "description": to_status_code(row["status"]).description,
-                        }
+            batch = {(row["aid"], row["iid"]) for row in char_payload}
+            status.update(_parse_subscription_response(response, batch))
 
         return status
 
@@ -450,7 +657,14 @@ class IpPairing(ZeroconfPairing):
         """
         await self.list_accessories_and_characteristics()
         self._accessories_state = AccessoriesState(self._accessories_state.accessories, config_num)
+        # An in-flight reply from the previous configuration must not restore
+        # a rejection that this refresh just invalidated.
+        self._subscription_generation += 1
+        self._unsupported_subscriptions.clear()
+        self._rejected_subscriptions.clear()
+        self._acknowledged_subscriptions.clear()
         self._callback_and_save_config_changed(self.config_num)
+        self._schedule_subscriptions()
 
     def _process_disconnected_events(self):
         """Process any events that happened while we were disconnected.

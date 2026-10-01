@@ -14,6 +14,8 @@ from aiohomekit.model.categories import Categories
 from aiohomekit.protocol import get_session_keys
 from aiohomekit.protocol.statuscodes import HapStatusCode
 from aiohomekit.zeroconf import HomeKitService
+from tests.accessoryserver import AccessoryRequestHandler
+from tests.subscription_clock import ControlledLoop
 
 
 def wrong_accessory_get_session_keys(
@@ -366,6 +368,86 @@ async def test_subscribe(pairing: IpPairing):
     characteristics = await pairing.get_characteristics([(1, 9)])
 
     assert characteristics == {(1, 9): {"value": False}}
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+async def test_reconnect_restores_events_after_lost_subscription(pairings, concurrent):
+    left, right = pairings
+    await right.get_characteristics([(1, 9)])
+    clock = right._subscription_loop = ControlledLoop()
+    loop = asyncio.get_running_loop()
+    connected, event = loop.create_future(), loop.create_future()
+
+    def handler(data):
+        if not data and not connected.done():
+            connected.set_result(None)
+        if (1, 9) in data and not event.done():
+            event.set_result(data)
+
+    right.dispatcher_connect(handler)
+    do_put = AccessoryRequestHandler.do_PUT
+    attempts = 0
+
+    def disconnect_once(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # Discard an actual encrypted request without replying. Reconnection
+            # and event delivery must then succeed through the normal TCP path.
+            request.close_connection = True
+            return
+        do_put(request)
+
+    with mock.patch.object(AccessoryRequestHandler, "do_PUT", disconnect_once):
+        if concurrent:
+            await asyncio.gather(right.subscribe([(1, 9)]), right.subscribe([(1, 9)]))
+        else:
+            await right.subscribe([(1, 9)])
+        await asyncio.wait_for(connected, 5)
+        assert attempts == 1
+        assert right._subscription_retry_at - clock.time() == 5
+        clock.advance()
+        await asyncio.wait_for(asyncio.shield(right._subscription_task), 5)
+
+    assert attempts == 2
+    assert right.supports_subscribe
+    with mock.patch.object(right, "get_characteristics", side_effect=AssertionError("Unexpected polling")):
+        await left.put_characteristics([(1, 9, True)])
+        assert await asyncio.wait_for(event, 5) == {(1, 9): {"value": True}}
+
+
+async def test_repeated_subscription_disconnects_keep_polling(pairing: IpPairing):
+    await pairing.get_characteristics([(1, 9)])
+    clock = pairing._subscription_loop = ControlledLoop()
+    connections = asyncio.Queue()
+
+    def handler(data):
+        if not data:
+            connections.put_nowait(pairing.connection.protocol)
+
+    pairing.dispatcher_connect(handler)
+    attempts = 0
+
+    def disconnect(request):
+        nonlocal attempts
+        attempts += 1
+        request.close_connection = True
+
+    with mock.patch.object(AccessoryRequestHandler, "do_PUT", disconnect):
+        await pairing.subscribe([(1, 9)])
+        await asyncio.wait_for(connections.get(), 5)
+        for delay in [5, 10]:
+            assert pairing._subscription_retry_at - clock.time() == delay
+            assert await pairing.get_characteristics([(1, 9)]) == {(1, 9): {"value": False}}
+            clock.advance()
+            await asyncio.wait_for(asyncio.shield(pairing._subscription_task), 5)
+            await asyncio.wait_for(connections.get(), 5)
+        assert await pairing.get_characteristics([(1, 9)]) == {(1, 9): {"value": False}}
+
+    assert attempts == 3
+    assert pairing.supports_subscribe
+    assert pairing.subscriptions == {(1, 9)}
+    assert pairing._subscription_retry_at - clock.time() == 20
 
 
 async def test_unsubscribe(pairing: IpPairing):
