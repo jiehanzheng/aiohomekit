@@ -67,6 +67,33 @@ RETRYABLE_SUBSCRIBE_STATUSES = {
 }
 
 
+def _parse_subscription_response(response: Any, batch: set[tuple[int, int]]) -> dict:
+    if not isinstance(response, dict):
+        raise RequestOutcomeUnknownError("Malformed subscription response")
+    if not response:
+        return {}  # HTTP 204 has no characteristic statuses.
+
+    global_status = response.get("status", 0)
+    if type(global_status) is not int:
+        raise RequestOutcomeUnknownError("Malformed subscription status")
+    codes = dict.fromkeys(batch, global_status) if global_status else {}
+    rows = response.get("characteristics", [])
+    if not isinstance(rows, list):
+        raise RequestOutcomeUnknownError("Malformed subscription characteristics")
+    for row in rows:
+        if not isinstance(row, dict) or any(
+            type(row.get(key)) is not int for key in ("aid", "iid", "status")
+        ):
+            raise RequestOutcomeUnknownError("Malformed subscription characteristic status")
+        codes[(row["aid"], row["iid"])] = row["status"]
+    if "status" not in response and not batch <= codes.keys():
+        raise RequestOutcomeUnknownError("Incomplete subscription response")
+    return {
+        char: {"status": code, "description": to_status_code(code).description}
+        for char, code in codes.items()
+    }
+
+
 def format_characteristic_list(
     data: dict[str, Any], requested_characteristics: set[tuple[int, int]] | None = None
 ) -> dict[tuple[int, int], dict[str, Any]]:
@@ -442,6 +469,9 @@ class IpPairing(ZeroconfPairing):
             self._acknowledged_subscriptions.clear()
             self._rejected_subscriptions.clear()
 
+    def _subscription_session_is_current(self, protocol, generation: int) -> bool:
+        return protocol is self.connection.protocol and generation == self._subscription_generation
+
     def _pending_subscriptions(self) -> set[tuple[int, int]]:
         return (
             self.subscriptions
@@ -517,58 +547,53 @@ class IpPairing(ZeroconfPairing):
             if self._shutdown or self._subscription_closed or not self.connection.is_connected:
                 return statuses
             self._set_subscription_session(self.connection.protocol)
-            while pending := self._pending_subscriptions():
+            attempted = set()
+            while pending := self._pending_subscriptions() - attempted:
                 if self._subscription_loop.time() < self._subscription_retry_at:
                     return statuses
-                retry = False
-                for _, group in groupby(sorted(pending), key=itemgetter(0)):
-                    batch = set(group) & self._pending_subscriptions()
-                    if not batch:
-                        continue
-                    session = self.connection.protocol
-                    generation = self._subscription_generation
-                    try:
-                        result = await self._update_subscriptions(batch, True)
-                    except HttpErrorResponse as ex:
-                        if (
-                            session is not self.connection.protocol
-                            or generation != self._subscription_generation
-                        ):
-                            return statuses
-                        self._rejected_subscriptions.update({char: {} for char in batch})
-                        logger.warning("%s: Subscription rejected with HTTP %s", self.name, ex.response.code)
-                        continue
-                    except RequestNotSentError as ex:
-                        if session is self.connection.protocol:
-                            self.connection._connection_lost(ex)
+                aid = min(pending)[0]
+                batch = {char for char in pending if char[0] == aid}
+                # Retryable rejections stay pending, but must wait for the next
+                # recovery pass rather than repeating inside this worker.
+                attempted.update(batch)
+                session = self.connection.protocol
+                generation = self._subscription_generation
+                try:
+                    result = await self._update_subscriptions(batch, True)
+                except HttpErrorResponse as ex:
+                    if not self._subscription_session_is_current(session, generation):
                         return statuses
-                    except AccessoryDisconnectedError:
-                        # A lost response cannot establish unsupported capability.
-                        # Retain intent; the timer bounds attempts, not their count.
-                        self._defer_subscriptions()
-                        return statuses
-
-                    if session is not self.connection.protocol or generation != self._subscription_generation:
-                        return statuses
-                    statuses.update(result)
-                    for char in batch:
-                        status = result.get(char, {})
-                        code = to_status_code(status.get("status", 0))
-                        if code == HapStatusCode.SUCCESS:
-                            self._acknowledged_subscriptions.add(char)
-                        elif code == HapStatusCode.NOTIFICATION_NOT_SUPPORTED:
-                            self._unsupported_subscriptions[char] = status
-                        elif code in RETRYABLE_SUBSCRIBE_STATUSES:
-                            retry = True
-                        else:
-                            self._rejected_subscriptions[char] = status
-                if retry:
+                    self._rejected_subscriptions.update({char: {} for char in batch})
+                    logger.warning("%s: Subscription rejected with HTTP %s", self.name, ex.response.code)
+                    continue
+                except RequestNotSentError as ex:
+                    if session is self.connection.protocol:
+                        self.connection._connection_lost(ex)
+                    return statuses
+                except AccessoryDisconnectedError:
+                    # A lost response cannot establish unsupported capability.
+                    # Retain intent; the timer bounds attempts, not their count.
                     self._defer_subscriptions()
                     return statuses
 
+                if not self._subscription_session_is_current(session, generation):
+                    return statuses
+                statuses.update(result)
+                for char in batch:
+                    status = result.get(char, {})
+                    code = to_status_code(status.get("status", 0))
+                    if code == HapStatusCode.SUCCESS:
+                        self._acknowledged_subscriptions.add(char)
+                    elif code == HapStatusCode.NOTIFICATION_NOT_SUPPORTED:
+                        self._unsupported_subscriptions[char] = status
+                    elif code not in RETRYABLE_SUBSCRIBE_STATUSES:
+                        self._rejected_subscriptions[char] = status
+
             # Partial batch success must not continually reset the backoff for
             # a bridge whose other subscriptions still fail on every attempt.
-            if self.subscriptions & self._acknowledged_subscriptions:
+            if self._pending_subscriptions():
+                self._defer_subscriptions()
+            elif self.subscriptions & self._acknowledged_subscriptions:
                 self._subscription_retry_at = 0.0
                 self._subscription_retry_delay = SUBSCRIBE_RETRY_INITIAL
             return statuses
@@ -609,41 +634,8 @@ class IpPairing(ZeroconfPairing):
                 "/characteristics",
                 {"characteristics": char_payload},
             )
-            if not isinstance(response, dict):
-                raise RequestOutcomeUnknownError("Malformed subscription response")
-            if response:
-                batch = {(row["aid"], row["iid"]) for row in char_payload}
-                if "status" in response and (
-                    not isinstance(response["status"], int) or isinstance(response["status"], bool)
-                ):
-                    raise RequestOutcomeUnknownError("Malformed subscription status")
-                if "status" in response and response["status"] != 0:
-                    status.update(
-                        {
-                            char: {
-                                "status": response["status"],
-                                "description": to_status_code(response["status"]).description,
-                            }
-                            for char in batch
-                        }
-                    )
-                # An empty body is a success response
-                rows = response.get("characteristics", [])
-                if not isinstance(rows, list):
-                    raise RequestOutcomeUnknownError("Malformed subscription characteristics")
-                for row in rows:
-                    if isinstance(row, dict) and all(
-                        isinstance(row.get(key), int) and not isinstance(row[key], bool)
-                        for key in ("aid", "iid", "status")
-                    ):
-                        status[(row["aid"], row["iid"])] = {
-                            "status": row["status"],
-                            "description": to_status_code(row["status"]).description,
-                        }
-                    else:
-                        raise RequestOutcomeUnknownError("Malformed subscription characteristic status")
-                if "status" not in response and not batch <= status.keys():
-                    raise RequestOutcomeUnknownError("Incomplete subscription response")
+            batch = {(row["aid"], row["iid"]) for row in char_payload}
+            status.update(_parse_subscription_response(response, batch))
 
         return status
 

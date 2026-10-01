@@ -139,6 +139,30 @@ async def test_retryable_hap_error_recovers_on_healthy_session(subscription_pair
     assert pairing._acknowledged_subscriptions == {(1, 9)}
 
 
+async def test_retryable_batch_does_not_repeat_or_suppress_other_accessories(subscription_pairing):
+    pairing = subscription_pairing
+
+    def response(path, payload):
+        if payload["characteristics"][0]["aid"] == 1:
+            return {"status": HapStatusCode.RESOURCE_BUSY.value}
+        return {}
+
+    pairing.connection.put_json.side_effect = response
+    result = await pairing.subscribe([(2, 9), (1, 9)])
+    assert result[(1, 9)]["status"] == HapStatusCode.RESOURCE_BUSY.value
+    assert pairing._acknowledged_subscriptions == {(2, 9)}
+    assert [
+        call.args[1]["characteristics"][0]["aid"] for call in pairing.connection.put_json.call_args_list
+    ] == [1, 2]
+    assert pairing._subscription_retry_at - pairing._subscription_loop.time() == 5
+
+    pairing.connection.put_json.side_effect = None
+    await advance_recovery(pairing)
+    assert pairing.connection.put_json.await_count == 3
+    assert pairing._acknowledged_subscriptions == {(1, 9), (2, 9)}
+    assert pairing._subscription_retry_delay == 5
+
+
 async def test_unsupported_characteristic_is_cached_until_config_changes(subscription_pairing):
     pairing = subscription_pairing
     pairing.connection.put_json.return_value = {
