@@ -41,6 +41,8 @@ from aiohomekit.exceptions import (
     HomeKitException,
     HttpErrorResponse,
     IncorrectPairingIdError,
+    RequestNotSentError,
+    RequestOutcomeUnknownError,
     TimeoutError,
 )
 from aiohomekit.http import HttpContentTypes
@@ -107,7 +109,7 @@ class InsecureHomeKitProtocol(asyncio.Protocol):
 
     def connection_lost(self, exception: Exception) -> None:
         self.connection._connection_lost(exception)
-        self._cancel_pending_requests()
+        self._cancel_pending_requests(exception)
 
     def _handle_timeout(self, fut: asyncio.Future[Any]) -> None:
         """Handle a timeout."""
@@ -127,7 +129,7 @@ class InsecureHomeKitProtocol(asyncio.Protocol):
             # to send them - and on that connection the keys would be different.
             # Also need to make sure that the new connection has chance to pair-verify before
             # queued writes can happy.
-            raise AccessoryDisconnectedError("Transport is closed")
+            raise RequestNotSentError("Transport is closed")
 
         # We return a future so that our caller can block on a reply
         # We can send many requests and dispatch the results in order
@@ -145,11 +147,16 @@ class InsecureHomeKitProtocol(asyncio.Protocol):
             # close the connection as we are now out of sync with the device
             # and any future requests will fail since the encryption counters
             # will be out of sync.
-            self.transport.write_eof()
+            if not result.done():
+                result.cancel()
             self.transport.close()
             if isinstance(ex, asyncio.TimeoutError):
                 timeout_expired = True
-                raise AccessoryDisconnectedError("Timeout while waiting for response") from ex
+                raise RequestOutcomeUnknownError("Timeout while waiting for response") from ex
+            if isinstance(ex, OSError):
+                # A failing write can still have submitted some bytes. It cannot
+                # establish whether the accessory applied the request.
+                raise RequestOutcomeUnknownError("Connection failed while submitting request") from ex
             raise
         finally:
             if not timeout_expired:
@@ -179,13 +186,15 @@ class InsecureHomeKitProtocol(asyncio.Protocol):
     def close(self):
         self._cancel_pending_requests()
 
-    def _cancel_pending_requests(self) -> None:
+    def _cancel_pending_requests(self, exception: Exception | None = None) -> None:
         # If the connection is closed then any pending callbacks will never
         # fire, so set them to an error state.
         while self.result_cbs:
             result = self.result_cbs.pop(0)
             if not result.done():
-                result.set_exception(AccessoryDisconnectedError("Connection closed"))
+                error = RequestOutcomeUnknownError("Connection closed")
+                error.__cause__ = exception
+                result.set_exception(error)
 
 
 class SecureHomeKitProtocol(InsecureHomeKitProtocol):
@@ -419,15 +428,17 @@ class HomeKitConnection:
 
         try:
             decoded = response.body.decode("utf-8")
-        except UnicodeDecodeError:
+        except UnicodeDecodeError as ex:
             self.transport.close()
-            raise AccessoryDisconnectedError("Session closed after receiving non-utf8 response")
+            raise RequestOutcomeUnknownError("Session closed after receiving non-utf8 response") from ex
 
         try:
             parsed = hkjson.loads(decoded)
-        except hkjson.JSON_DECODE_EXCEPTIONS:
+        except hkjson.JSON_DECODE_EXCEPTIONS as ex:
             self.transport.close()
-            raise AccessoryDisconnectedError("Session closed after receiving malformed response from device")
+            raise RequestOutcomeUnknownError(
+                "Session closed after receiving malformed response from device"
+            ) from ex
 
         return parsed
 
@@ -503,7 +514,7 @@ class HomeKitConnection:
         :param body: The body of the request (optional)
         """
         if not self.protocol:
-            raise AccessoryDisconnectedError("Connection lost before request could be sent")
+            raise RequestNotSentError("Connection lost before request could be sent")
 
         # WARNING: It is vital that a Host: header is present or some devices
         # will reject the request.
@@ -531,11 +542,11 @@ class HomeKitConnection:
 
         async with self._concurrency_limit:
             if not self.protocol:
-                raise AccessoryDisconnectedError("Tried to send while not connected")
+                raise RequestNotSentError("Tried to send while not connected")
             logger.debug("%s: raw request: %r", self.connected_host, request_bytes)
             resp = await self.protocol.send_bytes(request_bytes)
 
-        if resp.code >= 400 and resp.code <= 499:
+        if 400 <= resp.code <= 599:
             logger.debug(f"Got HTTP error {resp.code} for {method} against {target}")
             raise HttpErrorResponse(
                 f"Got HTTP error {resp.code} for {method} against {target}",
