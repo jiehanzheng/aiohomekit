@@ -187,6 +187,14 @@ class AccessoryDisconnectedError(HomeKitException):
         Exception.__init__(self, message)
 
 
+class RequestNotSentError(AccessoryDisconnectedError):
+    """The connection failed before the request was submitted to the transport."""
+
+
+class RequestOutcomeUnknownError(AccessoryDisconnectedError):
+    """The request may have been submitted, but its outcome cannot be established."""
+
+
 class ConnectionError(AccessoryDisconnectedError):
     """
     Used if a HomeKit disconnects part way through an operation or series of operations.
