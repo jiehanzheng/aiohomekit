@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import Generator
 from datetime import timedelta
+from threading import Event
 from typing import Any
 from unittest import mock
 
@@ -370,53 +371,73 @@ async def test_subscribe(pairing: IpPairing):
     assert characteristics == {(1, 9): {"value": False}}
 
 
-@pytest.mark.parametrize("concurrent", [False, True])
-async def test_reconnect_restores_events_after_lost_subscription(pairings, concurrent):
+async def test_lost_subscription_reply_recovers_events_despite_cancelled_caller(pairings):
     left, right = pairings
     await right.get_characteristics([(1, 9)])
     clock = right._subscription_loop = ControlledLoop()
     loop = asyncio.get_running_loop()
-    connected, event = loop.create_future(), loop.create_future()
+    accepted = loop.create_future()
+    release_reply = Event()
+    connections, events = asyncio.Queue(), asyncio.Queue()
 
     def handler(data):
-        if not data and not connected.done():
-            connected.set_result(None)
-        if (1, 9) in data and not event.done():
-            event.set_result(data)
+        (events if data else connections).put_nowait(data)
 
     right.dispatcher_connect(handler)
     do_put = AccessoryRequestHandler.do_PUT
-    attempts = 0
+    sessions = []
 
-    def disconnect_once(request):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            # Discard an actual encrypted request without replying. Reconnection
-            # and event delivery must then succeed through the normal TCP path.
+    def lose_first_reply(request):
+        sessions.append(request.session_id)
+        if len(sessions) == 1:
+            # Apply the real encrypted request, but withhold its acknowledgement.
+            # The client cannot know it succeeded, and the replacement session
+            # must subscribe again even though the accessory accepted the first.
+            with mock.patch.object(request, "end_headers"):
+                do_put(request)
+            assert (1, 9) in request.subscriptions
+            loop.call_soon_threadsafe(accepted.set_result, None)
+            assert release_reply.wait(5)
+            # The fixture retains closed handlers; drop their session-bound
+            # subscriptions so later broadcasts do not write to a dead socket.
+            request.subscriptions.clear()
             request.close_connection = True
             return
         do_put(request)
 
-    with mock.patch.object(AccessoryRequestHandler, "do_PUT", disconnect_once):
-        if concurrent:
-            await asyncio.gather(right.subscribe([(1, 9)]), right.subscribe([(1, 9)]))
-        else:
-            await right.subscribe([(1, 9)])
-        await asyncio.wait_for(connected, 5)
-        assert attempts == 1
-        assert right._subscription_retry_at - clock.time() == 5
+    with mock.patch.object(AccessoryRequestHandler, "do_PUT", lose_first_reply):
+        abandoned = asyncio.create_task(right.subscribe([(1, 9)]))
+        survivor = asyncio.create_task(right.subscribe([(1, 9)]))
+        try:
+            await asyncio.wait_for(accepted, 5)
+            worker = right._subscription_task
+            assert worker is not None
+            abandoned.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await abandoned
+            assert not worker.done()
+        finally:
+            release_reply.set()
+        assert await asyncio.wait_for(survivor, 5) == {}
+        await asyncio.wait_for(connections.get(), 5)
+        assert await right.get_characteristics([(1, 9)]) == {(1, 9): {"value": False}}
+        await right.subscribe([(1, 9)])
+        assert len(sessions) == 1
         clock.advance()
         await asyncio.wait_for(asyncio.shield(right._subscription_task), 5)
+        assert len(sessions) == 2
+        assert sessions[0] != sessions[1]
 
-    assert attempts == 2
-    assert right.supports_subscribe
     with mock.patch.object(right, "get_characteristics", side_effect=AssertionError("Unexpected polling")):
         await left.put_characteristics([(1, 9, True)])
-        assert await asyncio.wait_for(event, 5) == {(1, 9): {"value": True}}
+        assert await asyncio.wait_for(events.get(), 5) == {(1, 9): {"value": True}}
+        with mock.patch.object(right.connection, "put_json", wraps=right.connection.put_json) as requests:
+            await right.subscribe([(1, 9)])
+            requests.assert_not_awaited()
+    assert right.supports_subscribe
 
 
-async def test_repeated_subscription_disconnects_keep_polling(pairing: IpPairing):
+async def test_persistent_subscription_failure_bounds_retries_preserves_reads_and_stops(pairing):
     await pairing.get_characteristics([(1, 9)])
     clock = pairing._subscription_loop = ControlledLoop()
     connections = asyncio.Queue()
@@ -436,18 +457,34 @@ async def test_repeated_subscription_disconnects_keep_polling(pairing: IpPairing
     with mock.patch.object(AccessoryRequestHandler, "do_PUT", disconnect):
         await pairing.subscribe([(1, 9)])
         await asyncio.wait_for(connections.get(), 5)
-        for delay in [5, 10]:
+        # Cross the cap twice: a fixed delay, a retry limit, and an unbounded
+        # exponential delay must all fail this persistent-device scenario.
+        delays = [5, 10, 20, 40, 80, 160, 320, 640, 1280, 2560, 3600, 3600]
+        for expected_attempts, delay in enumerate(delays, 1):
             assert pairing._subscription_retry_at - clock.time() == delay
             assert await pairing.get_characteristics([(1, 9)]) == {(1, 9): {"value": False}}
+            await pairing.subscribe([(1, 9)])
+            await pairing.connection_made(True)
+            assert attempts == expected_attempts
+            assert pairing._subscription_retry_at - clock.time() == delay
             clock.advance()
             await asyncio.wait_for(asyncio.shield(pairing._subscription_task), 5)
             await asyncio.wait_for(connections.get(), 5)
-        assert await pairing.get_characteristics([(1, 9)]) == {(1, 9): {"value": False}}
 
-    assert attempts == 3
-    assert pairing.supports_subscribe
-    assert pairing.subscriptions == {(1, 9)}
-    assert pairing._subscription_retry_at - clock.time() == 20
+        assert attempts == len(delays) + 1
+        assert pairing.supports_subscribe
+        assert pairing.subscriptions == {(1, 9)}
+        timer = pairing._subscription_timer
+        await pairing.shutdown()
+        assert timer.cancelled
+        # Simulate a timer callback already queued when shutdown canceled it.
+        clock.now = timer.deadline
+        timer.callback(*timer.args)
+        await pairing.subscribe([(1, 9)])
+        await pairing.connection_made(True)
+        assert pairing._subscription_timer is None
+        assert pairing._subscription_task is None
+        assert attempts == len(delays) + 1
 
 
 async def test_unsubscribe(pairing: IpPairing):
